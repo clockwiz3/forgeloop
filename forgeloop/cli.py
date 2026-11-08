@@ -298,3 +298,56 @@ def serve(
     web = create_app(client, runs_dir=RUNS, tracer=tracer, api_key=os.environ.get("OPENROUTER_API_KEY"))
     typer.echo(f"ForgeLoop UI on http://127.0.0.1:{port}  (session budget ${budget_usd:.2f})")
     uvicorn.run(web, host="127.0.0.1", port=port, log_level="warning")
+
+
+@app.command()
+def doctor(
+    repo: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+    project_config: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+) -> None:
+    """Check a repository is ready: build its sandbox, run its checks on a pristine copy, all before any agent."""
+    import tempfile
+
+    from forgeloop import workspace
+    from forgeloop.gates.test_gate import run_test_gate
+    from forgeloop.tools import DockerSandbox
+
+    project = ProjectConfig.load(repo, project_config)
+    checks = project.checks
+
+    async def go() -> bool:
+        await _require_docker()
+        typer.echo("building the sandbox image (cached per dependency change)...")
+        image = await ensure_project_image(repo, project)
+        typer.echo(f"image: {image}")
+        with tempfile.TemporaryDirectory(prefix="forgeloop-doctor-") as tmp:
+            ws = workspace.prepare(repo, Path(tmp) / "ws", "doctor", clone=workspace.is_git_root(repo))
+            box = await DockerSandbox.start(
+                ws, image=image, user=project.sandbox.user if project.custom_image else None,
+                memory=project.sandbox.memory, cpus=project.sandbox.cpus,
+            )  # fmt: skip
+            try:
+                net = await box.exec(
+                    ["python", "-c", "import socket; socket.create_connection(('1.1.1.1', 53), 3)"], 20
+                )
+                typer.echo(f"network isolated: {'yes' if net.exit_code != 0 else 'NO'}")
+                for program in project.sandbox.programs:
+                    found = await box.exec([program, "--version"], 60)
+                    typer.echo(f"program {program}: {'ok' if found.exit_code == 0 else 'MISSING'}")
+                gate = await run_test_gate(
+                    box, ws, tests_cmd=checks.tests, lint_cmd=checks.lint or [], sast=checks.sast,
+                    test_timeout_s=checks.test_timeout_s,
+                )  # fmt: skip
+            finally:
+                await box.close()
+            workspace.remove(Path(tmp) / "ws")
+        for name, ok in gate.data["checks"].items():
+            typer.echo(f"check {name}: {'pass' if ok else 'FAIL'}")
+        if not gate.passed:
+            typer.echo("\nThe checks must pass on the untouched code, or every run would be sent back to fix them:\n")
+            typer.echo(gate.feedback[-4000:])
+        return gate.passed and net.exit_code != 0
+
+    if not asyncio.run(go()):
+        raise typer.Exit(1)
+    typer.echo("\nready")

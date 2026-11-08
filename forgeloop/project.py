@@ -29,6 +29,7 @@ with network access, and it runs the repository's own setup commands: treat it l
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -66,6 +67,7 @@ class SandboxConfig(_Strict):
     dockerfile: str | None = None  # path in the repo, built with the repo as context
     base_image: str = "python:3.12-slim"
     setup: list[str] = []  # shell commands run at build time (with network) after copying the repo in
+    env: dict[str, str] = {}  # baked into the image, e.g. HOME=/tmp (the root filesystem is read-only at run time)
     programs: list[str] = ["pytest", "python", "ruff"]  # what the agent may run with run_cmd
     user: str = "1000:1000"
     memory: str = "1g"
@@ -123,10 +125,8 @@ class ProjectConfig(_Strict):
 def generated_dockerfile(cfg: SandboxConfig) -> str:
     lines = [f"FROM {cfg.base_image}", "WORKDIR /work", "COPY . /work"]
     lines += [f"RUN {cmd}" for cmd in cfg.setup]
-    lines += [
-        "RUN chown -R 1000:1000 /work || true",
-        "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1",
-    ]
+    lines += ["RUN chown -R 1000:1000 /work || true", "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1"]
+    lines += [f"ENV {key}={json.dumps(value)}" for key, value in sorted(cfg.env.items())]
     return "\n".join(lines) + "\n"
 
 
