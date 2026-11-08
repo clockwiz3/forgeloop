@@ -157,3 +157,21 @@ def test_test_gate_uses_project_commands(tmp_path: Path) -> None:
 def test_requirements_files_are_parsed() -> None:
     text = "# deps\nrequests==2.32.0\n-r base.txt\nnumpy>=2\ngit+https://x/y.git\nPyYAML==6.0.1  # yaml\n"
     assert requirements(text) == {"requests": "2.32.0", "numpy": None, "pyyaml": "6.0.1"}
+
+
+def test_extra_ci_commands_are_part_of_the_gate(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path / "repo")
+    ws = workspace.prepare(repo, tmp_path / "ws", "w", clone=True)
+
+    class Box:
+        async def exec(self, argv: list[str], timeout_s: float) -> ExecResult:
+            return ExecResult(1 if argv[0] == "mypy" else 0, "app.py:1: error: bad type" if argv[0] == "mypy" else "")
+
+        async def close(self) -> None:
+            return None
+
+    gate = asyncio.run(
+        run_test_gate(Box(), ws, lint_cmd=[], sast=False, extra=[["ruff", "format", "--check"], ["mypy"]])
+    )
+    assert not gate.passed and gate.data["checks"]["ruff format --check"] and not gate.data["checks"]["mypy"]
+    assert "mypy fails" in gate.feedback and "bad type" in gate.feedback

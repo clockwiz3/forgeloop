@@ -334,7 +334,7 @@ class Orchestrator:
             workspace.commit_all(state.ws, f"forgeloop: {state.task.id} autofix")
         gate = await run_test_gate(
             sandbox, state.ws, tests_cmd=checks.tests, lint_cmd=checks.lint or [], sast=checks.sast,
-            test_timeout_s=checks.test_timeout_s,
+            test_timeout_s=checks.test_timeout_s, extra=checks.extra,
         )  # fmt: skip
         gate.data["round"] = state.test_rounds
         state.gates.append(gate)

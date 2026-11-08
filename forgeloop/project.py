@@ -78,6 +78,7 @@ class ChecksConfig(_Strict):
     tests: list[str] = ["pytest", "-q", "--tb=short", "-p", "no:cacheprovider"]
     lint: list[str] | None = ["ruff", "check", "."]
     autofix: list[str] | None = ["ruff", "check", "--fix", "--quiet", "."]
+    extra: list[list[str]] = []  # more commands that must exit 0, e.g. the rest of the project's CI (format, mypy)
     sast: bool = True  # bandit on added lines; the image must contain bandit
     test_timeout_s: int = 600
 

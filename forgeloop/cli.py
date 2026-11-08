@@ -336,7 +336,7 @@ def doctor(
                     typer.echo(f"program {program}: {'ok' if found.exit_code == 0 else 'MISSING'}")
                 gate = await run_test_gate(
                     box, ws, tests_cmd=checks.tests, lint_cmd=checks.lint or [], sast=checks.sast,
-                    test_timeout_s=checks.test_timeout_s,
+                    test_timeout_s=checks.test_timeout_s, extra=checks.extra,
                 )  # fmt: skip
             finally:
                 await box.close()

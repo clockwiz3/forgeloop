@@ -21,6 +21,8 @@ cpus = "2"
 tests = ["pytest", "-q", "--tb=short", "-p", "no:cacheprovider", "-m", "not live and not e2e and not render"]
 lint = ["ruff", "check", "."]
 autofix = ["ruff", "check", "--fix", "--quiet", "."]
+# The rest of menubench's CI: a PR that passes these will not be bounced by GitHub Actions.
+extra = [["ruff", "format", "--check", "."], ["mypy"]]
 sast = true
 test_timeout_s = 900
 

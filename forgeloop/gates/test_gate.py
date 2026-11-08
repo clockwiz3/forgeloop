@@ -151,6 +151,7 @@ async def run_test_gate(
     tests_cmd: list[str] | None = None,
     lint_cmd: list[str] | None = None,
     sast: bool = True,
+    extra: list[list[str]] | None = None,
     test_timeout_s: int = 600,
     sca_transport: httpx.AsyncBaseTransport | None = None,
 ) -> GateResult:
@@ -159,12 +160,15 @@ async def run_test_gate(
     lint_cmd = ["ruff", "check", "."] if lint_cmd is None else lint_cmd
     tests = await sandbox.exec(tests_cmd, test_timeout_s)
     lint = await sandbox.exec(lint_cmd, 300) if lint_cmd else None
+    extras = [(cmd, await sandbox.exec(cmd, test_timeout_s)) for cmd in extra or []]
     findings = await run_bandit(sandbox, ws, base) if sast else []
     sca = await check_dependencies(ws, base, transport=sca_transport)
 
     checks = {"tests": tests.exit_code == 0 and not tests.timed_out}
     if lint is not None:
         checks["lint"] = lint.exit_code == 0
+    for cmd, result in extras:
+        checks[" ".join(cmd)] = result.exit_code == 0 and not result.timed_out
     if sast:
         checks["bandit"] = not findings
     checks["dependencies"] = not sca
@@ -173,6 +177,9 @@ async def run_test_gate(
         feedback.append(f"Tests fail ({' '.join(tests_cmd)}):\n" + tests.output[-4000:])
     if lint is not None and not checks["lint"]:
         feedback.append(f"Lint fails ({' '.join(lint_cmd)}):\n" + lint.output[-2000:])
+    for cmd, result in extras:
+        if not checks[" ".join(cmd)]:
+            feedback.append(f"{' '.join(cmd)} fails:" + chr(10) + result.output[-2000:])
     if findings:
         feedback.append("Security findings (bandit) in the lines you added:\n" + "\n".join(findings))
     if sca:
