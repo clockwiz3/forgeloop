@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 EXCLUDE = (".git", ".env", "hidden", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".venv")
+BASE_REF = "forgeloop-base"  # the commit a run started from; diffs, SAST and SCA compare against it
 GIT_IDENTITY = ["-c", "user.name=forgeloop", "-c", "user.email=forgeloop@localhost", "-c", "commit.gpgsign=false"]
 
 
@@ -34,21 +35,37 @@ def git(ws: Path, *args: str) -> str:
     return out.stdout
 
 
-def prepare(source: Path, dest: Path, branch: str, *, setup: Path | None = None) -> Path:
-    """Copy `source` into `dest`, commit it as the baseline on `main`, switch to `branch` for the agent's work.
+def prepare(source: Path, dest: Path, branch: str, *, setup: Path | None = None, clone: bool = False) -> Path:
+    """A working copy of `source` on a new `branch`, with the starting point tagged as BASE_REF.
 
-    `setup` is a patch that becomes part of the baseline (a task's starting state differs from the bare repo).
+    clone=False: copy the files (minus secrets and caches) into a fresh repository. Used for the bench, where the
+    polygon is a subdirectory and hidden tests must never be copied.
+    clone=True: `git clone` the source, so the branch shares history with it and can be pushed as a pull request.
+    Only tracked files come along; untracked secrets such as .env stay behind.
+    `setup` is a patch that becomes part of the starting state.
     """
     if dest.exists():
         raise FileExistsError(dest)
-    shutil.copytree(source, dest, ignore=shutil.ignore_patterns(*EXCLUDE))
-    git(dest, "init", "-q", "-b", "main")
+    if clone:
+        subprocess.run(
+            ["git", "clone", "-q", "--local", "--no-hardlinks", str(source.resolve()), str(dest)],
+            check=True, capture_output=True,
+        )  # fmt: skip
+    else:
+        shutil.copytree(source, dest, ignore=shutil.ignore_patterns(*EXCLUDE))
+        git(dest, "init", "-q", "-b", "main")
     if setup is not None:
         apply_patch(dest, setup)
-    git(dest, "add", "-A")
-    git(dest, "commit", "-q", "-m", "baseline")
+    if not clone or setup is not None:
+        git(dest, "add", "-A")
+        git(dest, "commit", "-q", "--allow-empty", "-m", "baseline")
+    git(dest, "tag", BASE_REF)
     git(dest, "switch", "-q", "-c", branch)
     return dest
+
+
+def is_git_root(path: Path) -> bool:
+    return (path / ".git").exists()
 
 
 def commit_all(ws: Path, message: str) -> str | None:
@@ -60,7 +77,7 @@ def commit_all(ws: Path, message: str) -> str | None:
     return git(ws, "rev-parse", "--short", "HEAD").strip()
 
 
-def diff(ws: Path, base: str = "main") -> str:
+def diff(ws: Path, base: str = BASE_REF) -> str:
     return git(ws, "diff", f"{base}...HEAD")
 
 

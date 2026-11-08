@@ -12,8 +12,10 @@ from typing import Annotated
 import typer
 
 from forgeloop import bench, intake, report
+from forgeloop.deliver import DeliveryError, open_pull_request
 from forgeloop.eval import CONFIGS, RESULTS, EvalSettings, RunRecord, load_records, run_eval
 from forgeloop.orchestrator import Orchestrator, PipelineConfig, RunState, Stage
+from forgeloop.project import ProjectConfig, ensure_project_image
 from forgeloop.roles.planner import Plan
 from forgeloop.store import RunStore
 from forgeloop.tools.sandbox import docker_ready, ensure_image
@@ -60,6 +62,8 @@ def _print_outcome(state: RunState) -> None:
         typer.echo(f"  question for a human: {state.question}")
     if state.stage == Stage.DELIVERED:
         typer.echo(f"  PR description: {RUNS / state.run_id / 'PR.md'}")
+    if state.pr_url:
+        typer.echo(f"  pull request: {state.pr_url}")
     typer.echo(f"  workspace: {state.workspace}  (trace: forgeloop trace {state.run_id})")
 
 
@@ -67,15 +71,24 @@ def _print_outcome(state: RunState) -> None:
 def run(
     ticket: Annotated[Path | None, typer.Option(exists=True, dir_okay=False, help="Ticket in markdown")] = None,
     issue: Annotated[str | None, typer.Option(help="GitHub issue as owner/repo#number")] = None,
-    repo: Annotated[Path, typer.Option(exists=True, file_okay=False, help="Repository to work on (copied)")] = Path(
-        "bench/bench-repo"
-    ),
+    repo: Annotated[
+        Path, typer.Option(exists=True, file_okay=False, help="Repository to work on (never modified)")
+    ] = Path("bench/bench-repo"),
+    project_config: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, help="forgeloop.toml to use instead of <repo>/forgeloop.toml"),
+    ] = None,
     config: Annotated[str, typer.Option(help=f"Pipeline preset: {CONFIGS}")] = "full",
-    model: Annotated[str, typer.Option(help="Implementer model")] = DEFAULT_MODEL,
-    planner_model: Annotated[str, typer.Option()] = DEFAULT_MODEL,
-    reviewer_model: Annotated[str, typer.Option()] = DEFAULT_REVIEWER,
+    model: Annotated[str | None, typer.Option(help="Implementer model (default: project config, then haiku)")] = None,
+    planner_model: Annotated[str | None, typer.Option()] = None,
+    reviewer_model: Annotated[str | None, typer.Option()] = None,
     approve_plan: Annotated[bool, typer.Option("--approve-plan", help="Ask a human to approve the plan")] = False,
-    max_usd: Annotated[float, typer.Option(help="Budget for this run")] = 1.0,
+    max_usd: Annotated[
+        float | None, typer.Option(help="Budget for this run (default: project config, then $1)")
+    ] = None,
+    open_pr: Annotated[
+        bool, typer.Option("--open-pr", help="When delivered, push the branch and open a draft PR")
+    ] = False,
 ) -> None:
     """Run one ticket through the pipeline: plan, implement, gates, PR description (or escalation)."""
     if (ticket is None) == (issue is None):
@@ -86,27 +99,57 @@ def run(
     else:
         assert ticket is not None
         task = intake.from_markdown(ticket)
-    pipeline = PipelineConfig.preset(
-        config, implementer_model=model, planner_model=planner_model, reviewer_model=reviewer_model,
-        approve_plan=approve_plan, max_usd_per_run=max_usd,
-    )  # fmt: skip
+    project = ProjectConfig.load(repo, project_config)
 
     async def go() -> RunState:
         await _require_docker()
+        if project.custom_image:
+            typer.echo("preparing the project's sandbox image (built once per dependency change)...")
+        image = await ensure_project_image(repo, project)
+        pipeline = PipelineConfig.for_project(
+            config, project, image, implementer_model=model, planner_model=planner_model,
+            reviewer_model=reviewer_model, max_usd_per_run=max_usd, approve_plan=approve_plan,
+        )  # fmt: skip
         tracer = Tracer(RUNS / "trace.sqlite")
-        client = _client(max_usd * 1.1, tracer)
+        client = _client(pipeline.max_usd_per_run * 1.1, tracer)
+        store = RunStore()
         orch = Orchestrator(
-            client, RunStore(), tracer=tracer, approver=_approve_interactively, runs_dir=RUNS, log=typer.echo
+            client, store, tracer=tracer, approver=_approve_interactively, runs_dir=RUNS, log=typer.echo
         )
         try:
             state = orch.new_run(task, repo, pipeline)
             typer.echo(f"ticket: {task.title}")
-            typer.echo(f"run {state.run_id}  config={config}  implementer={model}  reviewer={reviewer_model}\n")
-            return await orch.run(state)
+            typer.echo(
+                f"run {state.run_id}  config={config}  implementer={pipeline.implementer_model}  "
+                f"reviewer={pipeline.reviewer_model}  sandbox={image}\n"
+            )
+            state = await orch.run(state)
         finally:
             await client.aclose()
+        if open_pr and state.stage == Stage.DELIVERED:
+            try:
+                url = open_pull_request(state)
+                store.save(state.run_id, state.task.id, state.stage.value, state.cost_usd, state)
+                store.event(state.run_id, state.stage.value, "pull_request", {"url": url})
+            except DeliveryError as exc:
+                typer.echo(f"could not open a pull request: {exc}")
+        return state
 
     _print_outcome(asyncio.run(go()))
+
+
+@app.command("open-pr")
+def open_pr_cmd(run_id: str) -> None:
+    """Push a delivered run's branch and open a draft pull request on GitHub."""
+    store = RunStore()
+    state = RunState.model_validate_json(store.load(run_id))
+    try:
+        url = open_pull_request(state)
+    except DeliveryError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    store.save(state.run_id, state.task.id, state.stage.value, state.cost_usd, state)
+    store.event(state.run_id, state.stage.value, "pull_request", {"url": url})
+    typer.echo(url)
 
 
 @app.command()

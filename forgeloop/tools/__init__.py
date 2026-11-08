@@ -8,8 +8,20 @@ from forgeloop.tools.fs import fs_tools
 from forgeloop.tools.sandbox import DockerSandbox, ExecResult, Sandbox, SandboxError
 
 
-def default_toolbox(ws: Workspace, sandbox: Sandbox) -> Toolbox:
-    return Toolbox([*fs_tools(ws), *exec_tools(ws, sandbox)])
+def default_toolbox(
+    ws: Workspace,
+    sandbox: Sandbox,
+    *,
+    programs: frozenset[str] = ALLOWED_PROGRAMS,
+    test_command: list[str] | None = None,
+    test_timeout_s: int = 180,
+) -> Toolbox:
+    return Toolbox(
+        [
+            *fs_tools(ws),
+            *exec_tools(ws, sandbox, programs=programs, test_command=test_command, test_timeout_s=test_timeout_s),
+        ]
+    )
 
 
 __all__ = [

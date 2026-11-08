@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -23,11 +23,13 @@ from forgeloop.gates import GateResult
 from forgeloop.gates.plan_gate import check_plan
 from forgeloop.gates.test_gate import run_test_gate
 from forgeloop.intake import Task
+from forgeloop.project import ChecksConfig, DeliverConfig, ProjectConfig
 from forgeloop.roles import implementer, planner, reviewer
 from forgeloop.roles.planner import Plan
 from forgeloop.roles.reviewer import Review
 from forgeloop.store import RunStore
 from forgeloop.tools import DockerSandbox, Sandbox, Workspace, default_toolbox
+from forgeloop.tools.sandbox import DEFAULT_IMAGE
 from llmcore import LLMClient, Tracer
 
 
@@ -64,6 +66,14 @@ class PipelineConfig(BaseModel):
     reviewer_reasoning: str | None = "low"  # reasoning models otherwise spend the output budget thinking
     temperature: float = 0.2
     variant: int = 0
+    # the project's sandbox and checks (forgeloop.toml); defaults are the bench polygon's
+    sandbox_image: str = DEFAULT_IMAGE
+    sandbox_user: str | None = None
+    sandbox_memory: str = "1g"
+    sandbox_cpus: str = "1"
+    programs: list[str] = ["pytest", "python", "ruff"]
+    checks: ChecksConfig = ChecksConfig()
+    deliver: DeliverConfig = DeliverConfig()
 
     @classmethod
     def preset(cls, name: str, **overrides: Any) -> PipelineConfig:
@@ -76,6 +86,30 @@ class PipelineConfig(BaseModel):
         if name not in flags:
             raise ValueError(f"unknown preset {name!r}; available: {sorted(flags)}")
         return cls(**{**flags[name], **overrides})
+
+    @classmethod
+    def for_project(cls, name: str, project: ProjectConfig, image: str, **overrides: Any) -> PipelineConfig:
+        """A preset with the project's sandbox, checks and defaults; explicit overrides (not None) win."""
+        base: dict[str, Any] = {
+            "sandbox_image": image,
+            "sandbox_user": project.sandbox.user if project.custom_image else None,
+            "sandbox_memory": project.sandbox.memory,
+            "sandbox_cpus": project.sandbox.cpus,
+            "programs": project.sandbox.programs,
+            "checks": project.checks,
+            "deliver": project.deliver,
+        }
+        for key, value in (
+            ("implementer_model", project.models.implementer),
+            ("planner_model", project.models.planner),
+            ("reviewer_model", project.models.reviewer),
+            ("max_usd_per_run", project.limits.max_usd_per_run),
+            ("max_steps", project.limits.max_steps),
+        ):
+            if value is not None:
+                base[key] = value
+        base.update({k: v for k, v in overrides.items() if v is not None})
+        return cls.preset(name, **base)
 
 
 class AgentSummary(BaseModel):
@@ -94,6 +128,9 @@ class RunState(BaseModel):
     config: PipelineConfig
     stage: Stage = Stage.PLAN
     workspace: str
+    source_repo: str | None = None  # the repository the run was cloned from (for opening a pull request)
+    cloned: bool = False
+    pr_url: str | None = None
     plan: Plan | None = None
     plan_attempts: int = 0
     plan_feedback: str | None = None
@@ -129,14 +166,26 @@ class Orchestrator:
     approver: Approver | None = None
     log: Callable[[str], None] | None = None  # human-readable progress, e.g. for the CLI
     runs_dir: Path = Path("runs")
-    sandbox_factory: Callable[[Path], Awaitable[Sandbox]] = field(default=DockerSandbox.start)
+    sandbox_factory: Callable[[Path], Awaitable[Sandbox]] | None = None  # tests inject fakes; default is Docker
 
     def new_run(
-        self, task: Task, repo: Path, config: PipelineConfig, *, setup: Path | None = None, run_id: str | None = None
+        self,
+        task: Task,
+        repo: Path,
+        config: PipelineConfig,
+        *,
+        setup: Path | None = None,
+        run_id: str | None = None,
+        clone: bool | None = None,
     ) -> RunState:
+        """`clone` defaults to True for a git repository root, so the result can become a pull request."""
         run_id = run_id or f"{task.id}-{uuid.uuid4().hex[:8]}"
-        ws = workspace.prepare(repo, self.runs_dir / run_id / "workspace", f"forgeloop/{task.id[:40]}", setup=setup)
-        state = RunState(run_id=run_id, task=task, config=config, workspace=str(ws))
+        clone = workspace.is_git_root(repo) if clone is None else clone
+        branch = f"{config.deliver.branch_prefix}{run_id[:60]}" if clone else f"forgeloop/{task.id[:40]}"
+        ws = workspace.prepare(repo, self.runs_dir / run_id / "workspace", branch, setup=setup, clone=clone)
+        state = RunState(
+            run_id=run_id, task=task, config=config, workspace=str(ws), source_repo=str(repo.resolve()), cloned=clone
+        )
         state.stage = Stage.PLAN if config.plan else Stage.IMPLEMENT
         self._save(state, "created", {"task": task.id, "config": config.model_dump()})
         return state
@@ -146,7 +195,14 @@ class Orchestrator:
 
     async def run(self, state: RunState) -> RunState:
         """Advance until delivered or escalated. Safe to call again on a loaded state (resume)."""
-        sandbox = await self.sandbox_factory(state.ws)
+        cfg = state.config
+        if self.sandbox_factory is not None:
+            sandbox = await self.sandbox_factory(state.ws)
+        else:
+            sandbox = await DockerSandbox.start(
+                state.ws, image=cfg.sandbox_image, user=cfg.sandbox_user, memory=cfg.sandbox_memory,
+                cpus=cfg.sandbox_cpus,
+            )  # fmt: skip
         handlers: dict[Stage, Callable[[RunState, Sandbox], Awaitable[None]]] = {
             Stage.PLAN: self._plan,
             Stage.PLAN_GATE: self._plan_gate,
@@ -272,10 +328,14 @@ class Orchestrator:
         return Stage.DELIVER
 
     async def _test_gate(self, state: RunState, sandbox: Sandbox) -> None:
-        # Deterministic autofix first: lint that a tool can fix is not worth a model round.
-        await sandbox.exec(["ruff", "check", "--fix", "--quiet", "."], 120)
-        workspace.commit_all(state.ws, f"forgeloop: {state.task.id} ruff --fix")
-        gate = await run_test_gate(sandbox, state.ws)
+        checks = state.config.checks
+        if checks.autofix:  # deterministic autofix first: lint a tool can fix is not worth a model round
+            await sandbox.exec(checks.autofix, 300)
+            workspace.commit_all(state.ws, f"forgeloop: {state.task.id} autofix")
+        gate = await run_test_gate(
+            sandbox, state.ws, tests_cmd=checks.tests, lint_cmd=checks.lint or [], sast=checks.sast,
+            test_timeout_s=checks.test_timeout_s,
+        )  # fmt: skip
         gate.data["round"] = state.test_rounds
         state.gates.append(gate)
         if gate.passed:
@@ -367,7 +427,10 @@ class Orchestrator:
         reasoning_effort: str | None = None,
     ) -> AgentResult:
         cfg = state.config
-        toolbox = default_toolbox(Workspace(state.ws), sandbox)
+        toolbox = default_toolbox(
+            Workspace(state.ws), sandbox, programs=frozenset(cfg.programs), test_command=cfg.checks.tests,
+            test_timeout_s=cfg.checks.test_timeout_s,
+        )  # fmt: skip
         if read_only:
             toolbox = toolbox.subset(read_only=True)
         remaining = max(cfg.max_usd_per_run - state.cost_usd, 0.0)

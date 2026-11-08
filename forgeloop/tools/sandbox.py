@@ -76,6 +76,7 @@ class DockerSandbox:
         image: str = DEFAULT_IMAGE,
         memory: str = "1g",
         cpus: str = "1",
+        user: str | None = None,
     ) -> DockerSandbox:
         workspace = workspace.resolve()
         name = f"forgeloop-{uuid.uuid4().hex[:12]}"
@@ -91,6 +92,8 @@ class DockerSandbox:
         ]  # fmt: skip
         if (workspace / ".git").is_dir():
             argv += ["-v", f"{workspace / '.git'}:{WORKDIR}/.git:ro"]
+        if user:
+            argv += ["--user", user]
         argv += [image, "sleep", "infinity"]
         started = await _run(*argv, timeout_s=120)
         if started.exit_code != 0:

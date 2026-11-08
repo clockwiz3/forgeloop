@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -61,14 +62,49 @@ async def osv_vulnerabilities(name: str, version: str, client: httpx.AsyncClient
     return [v.get("id", "?") for v in r.json().get("vulns", [])]
 
 
+def requirements(text: str) -> dict[str, str | None]:
+    """A requirements.txt: one spec per line; comments, options (-r, -e, --hash) and URLs are skipped."""
+    deps: dict[str, str | None] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-") or "://" in line:
+            continue
+        m = _REQ.match(line)
+        if m:
+            deps[m.group(1).lower().replace("_", "-")] = m.group(4)
+    return deps
+
+
+REQUIREMENT_FILES = ("requirements.txt", "requirements-dev.txt", "requirements/base.txt", "requirements/dev.txt")
+
+
+def _declared(read: Callable[[str], str | None]) -> dict[str, str | None]:
+    """All dependencies declared in pyproject.toml and requirement files."""
+    deps: dict[str, str | None] = {}
+    text = read("pyproject.toml")
+    if text:
+        deps.update(dependencies(text))
+    for name in REQUIREMENT_FILES:
+        text = read(name)
+        if text:
+            deps.update(requirements(text))
+    return deps
+
+
 async def check_dependencies(ws: Path, base: str, *, transport: httpx.AsyncBaseTransport | None = None) -> list[str]:
     """Problems with dependencies added or changed since `base`: unpinned, vulnerable, or unverifiable."""
-    try:
-        before = dependencies(workspace.git(ws, "show", f"{base}:pyproject.toml"))
-    except Exception:
-        before = {}
-    path = ws / "pyproject.toml"
-    after = dependencies(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    def at_base(path: str) -> str | None:
+        try:
+            return workspace.git(ws, "show", f"{base}:{path}")
+        except Exception:
+            return None
+
+    def now(path: str) -> str | None:
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    before, after = _declared(at_base), _declared(now)
     changed = {name: ver for name, ver in after.items() if name not in before or before[name] != ver}
     problems: list[str] = []
     async with httpx.AsyncClient(timeout=30, transport=transport) as client:
@@ -108,26 +144,37 @@ async def run_bandit(sandbox: Sandbox, ws: Path, base: str) -> list[str]:
 
 
 async def run_test_gate(
-    sandbox: Sandbox, ws: Path, *, base: str = "main", sca_transport: httpx.AsyncBaseTransport | None = None
+    sandbox: Sandbox,
+    ws: Path,
+    *,
+    base: str = workspace.BASE_REF,
+    tests_cmd: list[str] | None = None,
+    lint_cmd: list[str] | None = None,
+    sast: bool = True,
+    test_timeout_s: int = 600,
+    sca_transport: httpx.AsyncBaseTransport | None = None,
 ) -> GateResult:
-    tests = await sandbox.exec(["pytest", "-q", "--tb=short", "-p", "no:cacheprovider"], 300)
-    lint = await sandbox.exec(["ruff", "check", "."], 120)
-    sast = await run_bandit(sandbox, ws, base)
+    """Commands default to the bench project's; `lint_cmd=[]` switches linting off."""
+    tests_cmd = tests_cmd or ["pytest", "-q", "--tb=short", "-p", "no:cacheprovider"]
+    lint_cmd = ["ruff", "check", "."] if lint_cmd is None else lint_cmd
+    tests = await sandbox.exec(tests_cmd, test_timeout_s)
+    lint = await sandbox.exec(lint_cmd, 300) if lint_cmd else None
+    findings = await run_bandit(sandbox, ws, base) if sast else []
     sca = await check_dependencies(ws, base, transport=sca_transport)
 
-    checks = {
-        "tests": tests.exit_code == 0 and not tests.timed_out,
-        "ruff": lint.exit_code == 0,
-        "bandit": not sast,
-        "dependencies": not sca,
-    }
+    checks = {"tests": tests.exit_code == 0 and not tests.timed_out}
+    if lint is not None:
+        checks["lint"] = lint.exit_code == 0
+    if sast:
+        checks["bandit"] = not findings
+    checks["dependencies"] = not sca
     feedback: list[str] = []
     if not checks["tests"]:
-        feedback.append("Tests fail:\n" + tests.output[-4000:])
-    if not checks["ruff"]:
-        feedback.append("ruff check fails:\n" + lint.output[-2000:])
-    if sast:
-        feedback.append("Security findings (bandit) in the lines you added:\n" + "\n".join(sast))
+        feedback.append(f"Tests fail ({' '.join(tests_cmd)}):\n" + tests.output[-4000:])
+    if lint is not None and not checks["lint"]:
+        feedback.append(f"Lint fails ({' '.join(lint_cmd)}):\n" + lint.output[-2000:])
+    if findings:
+        feedback.append("Security findings (bandit) in the lines you added:\n" + "\n".join(findings))
     if sca:
         feedback.append("Dependency problems:\n" + "\n".join(sca))
     failed = [name for name, ok in checks.items() if not ok]
@@ -136,5 +183,5 @@ async def run_test_gate(
         passed=not failed,
         summary="all checks pass" if not failed else f"failed: {', '.join(failed)}",
         feedback="\n\n".join(feedback),
-        data={"checks": checks, "bandit": sast, "dependencies": sca},
+        data={"checks": checks, "bandit": findings, "dependencies": sca},
     )
