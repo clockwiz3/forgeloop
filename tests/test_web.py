@@ -140,3 +140,28 @@ def test_eval_results_are_served_as_data(tmp_path: Path) -> None:
         assert row["working"] == 1 and row["pass_at_1"] == 1.0
         assert detail["tasks"][0]["cells"]["baseline"][0]["passed"] is True
         assert client.get("/api/evals/..%2Fsecrets").status_code == 404
+
+
+def test_open_pr_button_calls_delivery_only_on_request(tmp_path: Path, repo: Path) -> None:
+    models = Models({"implementer": implementer_edits(1)})
+    opened: list[str] = []
+
+    def fake_deliver(state: Any) -> str:
+        opened.append(state.run_id)
+        state.pr_url = "https://github.com/o/r/pull/1"
+        return str(state.pr_url)
+
+    async def factory(_: Path) -> Sandbox:
+        return FakeSandbox([])
+
+    llm = LLMClient(api_key="k", transport=httpx.MockTransport(models), meter=Meter(limit_usd=1.0))
+    app = create_app(llm, runs_dir=tmp_path / "runs", sandbox_factory=factory, deliver_pr=fake_deliver)
+    with TestClient(app) as client:
+        body = {"source": "text", "title": "Fix", "body": "x", "repo": str(repo), "config": "baseline"}
+        run_id = client.post("/api/runs", json=body, headers=HEADERS).json()["state"]["run_id"]
+        wait_for(client, run_id, {"finished"})
+        assert opened == []  # delivery never happens by itself
+        assert client.post(f"/api/runs/{run_id}/open-pr").status_code == 403  # needs the CSRF header
+        r = client.post(f"/api/runs/{run_id}/open-pr", headers=HEADERS)
+        assert r.json() == {"url": "https://github.com/o/r/pull/1"} and opened == [run_id]
+        assert client.get(f"/api/runs/{run_id}").json()["state"]["pr_url"].endswith("/pull/1")

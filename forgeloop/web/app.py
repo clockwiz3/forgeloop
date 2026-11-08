@@ -23,8 +23,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from forgeloop import bench, intake, report, workspace
+from forgeloop.deliver import DeliveryError, open_pull_request
 from forgeloop.eval import CONFIGS, RESULTS, load_records
 from forgeloop.orchestrator import TERMINAL, Orchestrator, PipelineConfig, RunState
+from forgeloop.project import ProjectConfig, ensure_project_image
 from forgeloop.roles.planner import Plan
 from forgeloop.store import RunStore
 from forgeloop.tools import Sandbox
@@ -42,11 +44,12 @@ class RunRequest(BaseModel):
     task_id: str = ""  # bench task
     issue: str = ""  # owner/repo#number
     repo: str = "bench/bench-repo"
+    project_config: str = ""  # forgeloop.toml outside the repo; empty: <repo>/forgeloop.toml or defaults
     config: str = "full"
-    implementer_model: str = "anthropic/claude-haiku-5.5"
-    planner_model: str = "anthropic/claude-haiku-5.5"
-    reviewer_model: str = "z-ai/glm-5.3-flash"
-    max_usd: float = Field(1.0, gt=0, le=5)
+    implementer_model: str | None = None  # None: the project's default, then haiku
+    planner_model: str | None = None
+    reviewer_model: str | None = None
+    max_usd: float | None = Field(None, gt=0, le=5)
     approve_plan: bool = False
 
 
@@ -122,6 +125,8 @@ def create_app(
     sandbox_factory: Callable[[Path], Awaitable[Sandbox]] | None = None,
     results_dir: Path = RESULTS,
     api_key: str | None = None,
+    image_resolver: Callable[[Path, ProjectConfig], Awaitable[str]] | None = None,
+    deliver_pr: Callable[[RunState], str] = open_pull_request,
 ) -> FastAPI:
     manager = RunManager(
         client=client,
@@ -197,14 +202,18 @@ def create_app(
                 raise HTTPException(502, f"could not read the issue: {exc}") from exc
         if not repo.is_dir():
             raise HTTPException(422, f"repository not found: {repo}")
-        config = PipelineConfig.preset(
-            req.config,
-            implementer_model=req.implementer_model,
-            planner_model=req.planner_model,
-            reviewer_model=req.reviewer_model,
-            max_usd_per_run=req.max_usd,
-            approve_plan=req.approve_plan,
-        )
+        try:
+            project = ProjectConfig.load(repo, Path(req.project_config) if req.project_config else None)
+        except Exception as exc:
+            raise HTTPException(422, f"bad project config: {exc}") from exc
+        try:
+            image = await (image_resolver or ensure_project_image)(repo, project)
+        except Exception as exc:
+            raise HTTPException(500, f"could not prepare the sandbox image (try `forgeloop doctor`): {exc}") from exc
+        config = PipelineConfig.for_project(
+            req.config, project, image, implementer_model=req.implementer_model, planner_model=req.planner_model,
+            reviewer_model=req.reviewer_model, max_usd_per_run=req.max_usd, approve_plan=req.approve_plan,
+        )  # fmt: skip
         state = await asyncio.to_thread(manager.orchestrator().new_run, task, repo, config, setup=setup)
         manager.start(state)
         return view(state)
@@ -220,6 +229,18 @@ def create_app(
             raise HTTPException(409, "this run is not waiting for a plan decision")
         future.set_result(decision.approve)
         return {"ok": True}
+
+    @app.post("/api/runs/{run_id}/open-pr")
+    async def open_pr(run_id: str) -> dict[str, Any]:
+        """Pushes the branch and opens a draft pull request. Only ever on an explicit request from the user."""
+        state = load(run_id)
+        try:
+            url = await asyncio.to_thread(deliver_pr, state)
+        except DeliveryError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        manager.store.save(state.run_id, state.task.id, state.stage.value, state.cost_usd, state)
+        manager.store.event(state.run_id, state.stage.value, "pull_request", {"url": url})
+        return {"url": url}
 
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel(run_id: str) -> dict[str, Any]:

@@ -72,8 +72,8 @@ const CONFIG_HELP = {
 const MODELS = ["anthropic/claude-haiku-5.5", "google/gemini-2.5-flash-lite", "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash", "qwen/qwen3-coder-30b-a3b-instruct"];
 
 async function newRunPage() {
-  const form = { source: "bench", task_id: "", title: "", body: "", issue: "", repo: "bench/bench-repo", config: "full",
-    implementer_model: MODELS[0], planner_model: MODELS[0], reviewer_model: "z-ai/glm-5.3-flash", max_usd: 1, approve_plan: true };
+  const form = { source: "bench", task_id: "", title: "", body: "", issue: "", repo: "bench/bench-repo", project_config: "",
+    config: "full", implementer_model: "", planner_model: "", reviewer_model: "", max_usd: "", approve_plan: true };
   const tasks = await api("/api/tasks");
   const sourceBox = h("div");
   const error = h("div", { class: "error" });
@@ -90,6 +90,11 @@ async function newRunPage() {
     oninput: (e) => { form[key] = attrs.type === "number" ? Number(e.target.value) : e.target.value; },
   });
 
+  const repoFields = () => [
+    h("label", {}, "Repository ", h("span", { class: "hint" }, "local path; a git repo is cloned, the original is never touched")), input("repo"),
+    h("label", {}, "Project config ", h("span", { class: "hint" }, "optional forgeloop.toml outside the repo; run `forgeloop doctor` once first")),
+    input("project_config", { placeholder: "examples/menubench/forgeloop.toml" }),
+  ];
   const drawSource = () => {
     if (form.source === "bench") {
       const cards = h("div", { class: "cards" });
@@ -105,11 +110,11 @@ async function newRunPage() {
         h("label", {}, "Title"), input("title", { placeholder: "Search ignores letter case" }),
         h("label", {}, "Ticket ", h("span", { class: "hint" }, "markdown: symptom or desired behaviour, acceptance criteria")),
         input("body", { multiline: true, placeholder: "Searching for 'tent' finds nothing, 'Tent' works…" }),
-        h("label", {}, "Repository ", h("span", { class: "hint" }, "local path; it is copied, the original is never touched")), input("repo"));
+        ...repoFields());
     } else {
       mount(sourceBox,
         h("label", {}, "GitHub issue ", h("span", { class: "hint" }, "read with your gh login")), input("issue", { placeholder: "owner/repo#123" }),
-        h("label", {}, "Repository ", h("span", { class: "hint" }, "local checkout of that repo")), input("repo"));
+        ...repoFields());
     }
   };
   drawSource();
@@ -120,7 +125,9 @@ async function newRunPage() {
     submit.disabled = true;
     error.textContent = "";
     try {
-      const run = await api("/api/runs", { method: "POST", body: form });
+      const body = Object.fromEntries(Object.entries(form).filter(([, v]) => v !== ""));
+      if (body.max_usd !== undefined) body.max_usd = Number(body.max_usd);
+      const run = await api("/api/runs", { method: "POST", body });
       location.hash = `#/run/${run.state.run_id}`;
     } catch (e) { error.textContent = e.message; submit.disabled = false; }
   } }, "Start run");
@@ -134,11 +141,11 @@ async function newRunPage() {
       seg(Object.keys(CONFIG_HELP).map((c) => [c, c]), "config", () => { configHelp.textContent = CONFIG_HELP[form.config]; }),
       h("div", { style: { marginTop: "8px" } }, configHelp),
       h("div", { class: "grid-3" },
-        h("div", {}, h("label", {}, "Implementer"), input("implementer_model", { list: "models" })),
-        h("div", {}, h("label", {}, "Planner"), input("planner_model", { list: "models" })),
-        h("div", {}, h("label", {}, "Reviewer"), input("reviewer_model", { list: "models" }))),
+        h("div", {}, h("label", {}, "Implementer"), input("implementer_model", { list: "models", placeholder: "project default / haiku" })),
+        h("div", {}, h("label", {}, "Planner"), input("planner_model", { list: "models", placeholder: "project default / haiku" })),
+        h("div", {}, h("label", {}, "Reviewer"), input("reviewer_model", { list: "models", placeholder: "project default / glm-5.3-flash" }))),
       h("div", { class: "grid-2" },
-        h("div", {}, h("label", {}, "Budget for this run, $ ", h("span", { class: "hint" }, "hard stop; typical ticket on haiku: $0.02–0.05")), input("max_usd", { type: "number" })),
+        h("div", {}, h("label", {}, "Budget for this run, $ ", h("span", { class: "hint" }, "hard stop; typical ticket on haiku: $0.02–0.05")), input("max_usd", { type: "number", placeholder: "project default / 1" })),
         h("label", { class: "check" }, h("input", { type: "checkbox", checked: form.approve_plan, onchange: (e) => { form.approve_plan = e.target.checked; } }),
           "Ask me to approve the plan before any code is written"))),
     h("div", { class: "row" }, submit, error));
@@ -230,7 +237,18 @@ async function runPage(runId) {
       mount(banner, h("div", { class: "banner warn" }, h("h2", {}, "Escalated to a human"), h("div", {}, s.escalation),
         s.question ? h("div", { style: { marginTop: "8px" } }, h("b", {}, "Question: "), s.question) : null));
     } else if (s.stage === "delivered") {
-      mount(banner, h("div", { class: "banner ok" }, h("h2", {}, "Delivered"), "All enabled gates passed. The PR description is in the PR tab."));
+      const prError = h("div", { class: "error" });
+      const prButton = h("button", { class: "primary", onclick: async () => {
+        prButton.disabled = true;
+        prError.textContent = "";
+        try { await api(`/api/runs/${runId}/open-pr`, { method: "POST" }); data = await api(`/api/runs/${runId}`); drawAll(); }
+        catch (e) { prError.textContent = e.message; prButton.disabled = false; }
+      } }, "Open draft PR on GitHub");
+      const action = s.pr_url
+        ? h("div", {}, "Pull request: ", h("a", { href: s.pr_url, target: "_blank", rel: "noopener noreferrer" }, s.pr_url))
+        : s.cloned ? h("div", { class: "row", style: { marginTop: "10px" } }, prButton, h("span", { class: "muted" }, "pushes the branch with your git credentials"), prError)
+          : h("div", { class: "muted" }, "This run worked on a copy without git history, so it cannot become a pull request.");
+      mount(banner, h("div", { class: "banner ok" }, h("h2", {}, "Delivered"), "All enabled gates passed. The PR description is in the PR tab.", action));
     } else mount(banner);
   };
 

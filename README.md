@@ -56,6 +56,33 @@ This writes `runs/<run_id>/PR.md` ([example](docs/example-PR.md)) and the work b
 - `forgeloop validate`: checks that every bench task's hidden tests fail without the fix and pass with the reference, 3 times.
 - `forgeloop eval --id X --config baseline --config full`, `forgeloop report --id X`.
 
+## On your own repository
+
+Describe the project once in `forgeloop.toml`. It can live in the repository, or anywhere else if you pass `--project-config`. The file covers:
+
+- how to build its sandbox;
+- what the agent may run;
+- which checks must pass;
+- the defaults for models and budgets.
+
+[examples/menubench/forgeloop.toml](examples/menubench/forgeloop.toml) is a worked example for a real repo with locked dependencies, mypy and a format check in CI.
+
+```bash
+uv run forgeloop doctor --repo ../menubench --project-config examples/menubench/forgeloop.toml
+uv run forgeloop run --repo ../menubench --project-config examples/menubench/forgeloop.toml     --ticket examples/menubench/ticket-mkd-bgn.md --open-pr
+```
+
+- **`doctor` comes first.** It builds the project's sandbox image, checks that the network is cut off and the allowed programs exist, and runs every check on the untouched code. If a check fails before any agent starts, every run would be sent back to fix it.
+- **The sandbox image** is built once from a clean checkout of tracked files, so `.env`, history and untracked files never get in. It is rebuilt only when the recipe or a dependency file changes. The build is the only step with network access, and it runs the project's own setup commands, like its CI would.
+- **Git repositories are cloned, not copied.** The run's branch shares history with origin, and `--open-pr` (or the button in the web UI) pushes it and opens a draft pull request with your own git and `gh` credentials. Nothing is pushed unless you ask.
+- **The test gate runs the project's commands:** tests, lint, any `extra` CI commands (here `ruff format --check` and `mypy`), bandit on the added lines, and an OSV check of new or changed dependencies, including those in `requirements*.txt`.
+
+**First real ticket.** On MenuBench, the ticket "recognise Macedonian denar and Bulgarian lev prices" touches a currency table and three regular expressions.
+
+- The full pipeline delivered it in one pass for $0.036: a plan of 4 checkpoints, all gates green, reviewer approved.
+- Every example from the ticket parsed correctly in an independent check. So did the traps: "3 дена" (3 days) and "7 дней" were not mistaken for prices.
+- The project's own CI checks (format, mypy) passed on the result.
+
 ## Web UI
 
 ```bash
@@ -175,6 +202,8 @@ forgeloop/
   gates/            plan gate, test gate (tests, ruff, bandit, OSV)
   tools/            file tools with path policy, command tools, Docker sandbox
   store.py          SQLite: runs, state checkpoints, events
+  project.py        forgeloop.toml and the per-project sandbox image
+  deliver.py        push the branch and open a draft pull request
   web/              local web UI: FastAPI + a build-free frontend
   eval.py, report.py, bench.py, grading.py, cli.py
 llmcore/            OpenRouter client: tool use, prompt caching, retries, fallback,
@@ -182,6 +211,7 @@ llmcore/            OpenRouter client: tool use, prompt caching, retries, fallba
 bench/bench-repo/   the polygon service
 bench/tasks/        tickets, hidden tests, setup and reference patches
 evals/              results (JSONL) and the report
+examples/menubench/ forgeloop.toml and a real ticket for an outside repository
 ```
 
 `llmcore` grew out of the model client in [MenuBench](https://github.com/clockwiz3/menubench). The retries, response cache and budget meter come from there; multi-turn tool use, cache breakpoints, tracing and pricing were added here.
@@ -194,6 +224,8 @@ evals/              results (JSONL) and the report
 - A direct Anthropic Messages API provider next to OpenRouter, and an agent-SDK backend for comparison.
 - Escalate a checkpoint that fails twice to a stronger model instead of straight to a human.
 - More repeats on the weak-model track, and a harder, larger bench.
+- Languages other than Python: the sandbox and checks are already per-project; the path policy, SAST and SCA are still Python-specific.
+- Pick up tickets automatically: label a GitHub issue, get a draft PR.
 
 ## Cost of all experiments
 
